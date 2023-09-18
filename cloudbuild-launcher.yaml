@@ -1,0 +1,28 @@
+substitutions:
+  _SKAFFOLD_VERSION: "v2.6.0"
+  _SKAFFOLD_URL: "https://storage.googleapis.com/skaffold/releases/${_SKAFFOLD_VERSION}/skaffold-linux-amd64"
+  _WORKER_SERVICE_ACCOUNT: <DEVELOPER_SERVICE_ACCOUNT>
+
+steps:
+- name:  gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    curl -Lo "/tmp/skaffold" '${_SKAFFOLD_URL}' &&
+    install /tmp/skaffold /usr/bin &&
+    IMAGE_NAME_AND_TAG=$(skaffold build --dry-run -q | sed -E 's/.*"tag":"([^,"]*)"?.*/\1/g') &&
+    gcloud builds submit "${_REPO_URL}" 
+    --git-source-revision=${COMMIT_SHA}
+    --substitutions=_IMAGE_NAME_AND_TAG=$${IMAGE_NAME_AND_TAG}
+    --region=${LOCATION} 
+    --config=cloudbuild.yaml
+    --async
+
+options:
+  dynamic_substitutions: true
+  logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: 'projects/${PROJECT_ID}/locations/us-central1/workerPools/hello-world-private-pool'

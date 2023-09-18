@@ -1,0 +1,25 @@
+apiVersion: deploy.cloud.google.com/v1
+kind: DeliveryPipeline
+metadata:
+  name: spring-java-hello-world-pipeline
+description: main application pipeline
+serialPipeline:
+  stages:
+  - targetId: staging
+    profiles: [staging]
+---
+
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: staging
+description: staging cluster
+gke:
+  cluster: projects/springboard-test-3/locations/us-central1/clusters/hello-world-cluster
+executionConfigs:
+- usages:
+  - DEPLOY
+  workerPool: "projects/springboard-test-3/locations/us-central1/workerPools/hello-world-private-pool"
+- usages:
+  - RENDER
+  - VERIFY

@@ -1,0 +1,157 @@
+substitutions:
+  _IMAGE_NAME: spring-java-hello-world
+  _IMAGE_NAME_AND_TAG: "<provided at build submit time>"
+  _DOCKER_REPO_NAME: hello-world-docker-repository
+  _DOCKER_REPO_URL: "us-central1-docker.pkg.dev/${PROJECT_ID}/${_DOCKER_REPO_NAME}"
+  _IMAGE_URL: "${_DOCKER_REPO_URL}/${_IMAGE_NAME_AND_TAG}"
+  _ATTESTOR_NAME: springboard-hello-world-attestor
+  _KMS_KEYRING_NAME: springboard-keyring
+  _KMS_KEY_NAME: springboard-key
+  _KMS_KEY_VERSION: "1"
+  _COLON_CHAR: ":"
+  _MVN_VERSION: "3.8.7"
+  _SKAFFOLD_VERSION: "v2.6.0"
+  _MVN_URL: "https://us-maven.pkg.dev/cloud-aoss/java/org/apache/maven/apache-maven/${_MVN_VERSION}/apache-maven-${_MVN_VERSION}-bin.zip"
+  _SKAFFOLD_URL: "https://storage.googleapis.com/skaffold/releases/${_SKAFFOLD_VERSION}/skaffold-linux-amd64"
+  _TOKEN_URL: "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+  _WORKER_SERVICE_ACCOUNT: <DEVELOPER_SERVICE_ACCOUNT>
+
+steps:
+- # Copy the docker client binary out of the docker container
+  # so that the next step can use skaffold to build the container with docker.
+  # This is all to accommodate consistent container sha's for S3C
+  name: gcr.io/cloud-builders/docker
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    cp /bin/docker /workspace/docker
+
+- # Build the container with Skaffold to the local docker daemon.
+  name: gcr.io/cloud-builders/mvn
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    export GOOGLE_OAUTH_ACCESS_TOKEN="$(curl ${_TOKEN_URL} -H 'Metadata-Flavor:Google' |  sed -E 's/.*"access_token":"?([^,"]*)"?.*/\1/')" &&
+    export M2_HOME="/opt/apache-maven/apache-maven-${_MVN_VERSION}" &&
+    export MAVEN_CONFIG="" &&
+    AUTHORIZATION_HEADER="Authorization${_COLON_CHAR} Bearer $${GOOGLE_OAUTH_ACCESS_TOKEN}" &&
+    mkdir -p /opt/apache-maven /root/.m2 /tmp/bin &&
+    mv /workspace/docker /usr/bin &&
+    cp /workspace/config/maven_settings.xml /root/.m2/settings.xml &&
+    curl -Lo "$${M2_HOME}.zip" -H "$$AUTHORIZATION_HEADER" '${_MVN_URL}' &&
+    curl -Lo "/tmp/skaffold" '${_SKAFFOLD_URL}' &&
+    install /tmp/skaffold /usr/bin &&
+    skaffold build
+    --interactive=false
+    --file-output=/workspace/artifacts.json 
+    --cache-artifacts=false
+    --filename=skaffold.yaml
+    --profile=staging
+    --default-repo=${_DOCKER_REPO_URL}
+
+- # Re-tag docker image with proper tags, push the container, 
+  # and update /workspace/artifacts.json with real container sha and tags.
+  name: 'gcr.io/cloud-builders/docker'
+  entrypoint: bash
+  args: 
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    IMAGE_URI_PRE_TAG=$(cat /workspace/artifacts.json | sed -E 's/.*"tag":"([^,"]*)"?.*/\1/g') &&
+    docker tag $$IMAGE_URI_PRE_TAG $_IMAGE_URL &&
+    IMAGE_SHA_DOCKER=$(docker push $_IMAGE_URL | tail -1 | sed -E 's/.*digest: ([^ ]*)?.*/\1/g') &&
+    sed -E "s/(\"tag\":\".*)${_IMAGE_NAME}:([^,\"]*)/\1${_IMAGE_NAME_AND_TAG}@$${IMAGE_SHA_DOCKER}/g" -i /workspace/artifacts.json &&
+    cat /workspace/artifacts.json | sed -E 's/.*"tag":"([^,"]*)"?.*/\1/g' > /workspace/image_uri.txt
+
+- # Scan the container and validate that there or no HIGH or CRITICAL vulnerabilities
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    SCAN_URI=$(gcloud artifacts docker images scan $_IMAGE_URL
+    --remote
+    --additional-package-types "GO,MAVEN"
+    --format "value(response.scan)") &&
+    VULERNABILITIES_RESULTS=$(gcloud artifacts docker images list-vulnerabilities $$SCAN_URI --format="value(vulnerability.effectiveSeverity)") &&
+    SEVERE_VULNERABILITIES=$(echo $$VULERNABILITIES_RESULTS | grep -e "HIGH" -e "CRITICAL" || true) &&
+    if [ -n "$$SEVERE_VULNERABILITIES" ]; then
+      echo "Error: Found HIGH or CRITICAL vulnerabilities in scan: $$SCAN_URI" &&
+      echo "For more information run: gcloud artifacts docker images list-vulnerabilities $$SCAN_URI" &&
+      exit 1
+    else
+      echo "Success: No HIGH or CRITICAL vulnerabilities were found in this scan"
+    fi
+
+- # Create the attestation
+  name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    IMAGE_URI_NO_TAG=$(cat /workspace/image_uri.txt | sed -E "s/(.*)\:.*(@.*)/\1\2/") &&
+    echo "Attesting image uri: $${IMAGE_URI_NO_TAG}" &&
+    EXISTING_ATTESTATION=$(gcloud beta container binauthz attestations list
+    --attestor-project ${PROJECT_ID}
+    --attestor ${_ATTESTOR_NAME}
+    --format json | grep "$$IMAGE_URI_NO_TAG" || true) &&
+    if [ -z "$${EXISTING_ATTESTATION}" ]; then
+      
+    gcloud beta container binauthz attestations sign-and-create
+    --project="${PROJECT_ID}"
+    --artifact-url="$$IMAGE_URI_NO_TAG"
+    --attestor="${_ATTESTOR_NAME}"
+    --attestor-project="${PROJECT_ID}"
+    --keyversion-project="${PROJECT_ID}"
+    --keyversion-location="us-central1"
+    --keyversion-keyring="${_KMS_KEYRING_NAME}"
+    --keyversion-key="${_KMS_KEY_NAME}"
+    --keyversion="${_KMS_KEY_VERSION}"
+    --quiet
+    
+    else
+      echo "Attestation already found for container: $${IMAGE_URI_NO_TAG}"
+    fi
+
+- # Create Cloud Deploy Release for Continuous Deployment
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  entrypoint: bash
+  args:
+  - '-eo'
+  - 'pipefail'
+  - '-c'
+  - >
+    SHORT_BUILD_ID=$(echo ${BUILD_ID} | cut -d- -f1) &&
+    gcloud beta deploy releases create
+    release-${SHORT_SHA}-$${SHORT_BUILD_ID}
+    --delivery-pipeline "${_IMAGE_NAME}-pipeline"
+    --description "Release demo"
+    --region "us-central1"
+    --skaffold-file "/workspace/skaffold.yaml"
+    --annotations="release-id=rel-${SHORT_SHA}-$${SHORT_BUILD_ID}"
+    --build-artifacts="/workspace/artifacts.json"
+    --project $PROJECT_ID
+
+images:
+- "$_IMAGE_URL"
+
+serviceAccount: 'projects/${PROJECT_ID}/serviceAccounts/${_WORKER_SERVICE_ACCOUNT}'
+
+options:
+  dynamic_substitutions: true
+  logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: 'projects/${PROJECT_ID}/locations/us-central1/workerPools/hello-world-private-pool'
+  requestedVerifyOption: VERIFIED
+  substitutionOption: 'ALLOW_LOOSE'
